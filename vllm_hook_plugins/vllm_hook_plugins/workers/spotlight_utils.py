@@ -164,6 +164,84 @@ def reshape_attn_output(
     # Reshape to [batch, seq, hidden_size]
     return output.view(batch_size, seq_len, hidden_size)
 
+def compute_spotlight_bias(
+    logits: torch.Tensor,
+    span_ranges: List[List[Tuple[int, int]]],
+    target_proportion: float,
+) -> torch.Tensor:
+    """
+    Apply Spotlight attention biasing (matches reference implementation).
+
+    Reference: agent-lifecycle-toolkit SpotLightComponent.create_attention_bias_hook
+
+    Algorithm (per batch item):
+    1. Compute attention weights via softmax(logits)
+    2. Compute current_proportion = sum of attention on span / total
+    3. If current_proportion < target_proportion:
+       a. Convert weights to log-domain: log(weights + eps)
+       b. Add bias = log(target / current) to span positions
+       c. Re-normalize with softmax
+    4. Only increases attention toward span (never decreases)
+
+    Args:
+        logits: Raw attention logits, shape [batch, num_heads, q_len, k_len]
+        span_ranges: List of span-range lists (one per batch item)
+        target_proportion: Target proportion of attention on span (0.0 to 1.0)
+
+    Returns:
+        Modified attention weights (post-softmax), same shape as logits
+    """
+    # Compute baseline attention weights
+    attn_weights = F.softmax(logits, dim=-1)
+    modified_weights = attn_weights.clone()
+
+    for batch_idx, ranges in enumerate(span_ranges):
+        if not ranges:
+            continue
+
+        # Create union mask for emphasized token positions
+        union_mask = torch.zeros(
+            modified_weights.size(-1),
+            device=modified_weights.device,
+            dtype=modified_weights.dtype,
+        )
+        for start, end in ranges:
+            union_mask[start:end] = 1.0
+        union_mask = union_mask.view(1, 1, -1)  # [1, 1, k_len]
+
+        # Current proportion: global across all heads and query positions
+        current_proportion = (
+            modified_weights[batch_idx] * union_mask
+        ).sum() / modified_weights[batch_idx].sum()
+
+        print(f"[BIAS] current={current_proportion:.4f}, target={target_proportion:.4f}, steer={current_proportion < target_proportion}")
+
+        # Only steer upward (matching reference implementation)
+        if current_proportion < target_proportion:
+            bias_value = torch.log(
+                torch.tensor(
+                    target_proportion / current_proportion,
+                    device=modified_weights.device,
+                    dtype=torch.float32,
+                )
+            )
+            bias_mask = union_mask * bias_value
+
+            # Apply bias in log-domain of attention weights, then re-softmax
+            attn_logits = logits[batch_idx].float()
+            attn_logits = attn_logits + bias_mask
+            modified_weights[batch_idx] = F.softmax(
+                attn_logits, dim=-1, dtype=torch.float32
+            ).to(modified_weights.dtype)
+
+            # Diagnostic: verify new proportion
+            new_proportion = (
+                modified_weights[batch_idx] * union_mask
+            ).sum() / modified_weights[batch_idx].sum()
+            print(f"[BIAS] after steering: {new_proportion:.4f}")
+
+    return modified_weights
+
 
 def compute_spotlight_bias(
     logits: torch.Tensor,
@@ -229,7 +307,8 @@ def compute_spotlight_bias(
             bias_mask = union_mask * bias_value
 
             # Apply bias in log-domain of attention weights, then re-softmax
-            attn_logits = torch.log(modified_weights[batch_idx] + 1e-10)
+            attn_logits = logits[batch_idx].float()  # Use original logits for bias application
+            #attn_logits = torch.log(modified_weights[batch_idx] + 1e-10)
             attn_logits = attn_logits + bias_mask
             modified_weights[batch_idx] = F.softmax(
                 attn_logits, dim=-1, dtype=torch.float32
@@ -242,6 +321,78 @@ def compute_spotlight_bias(
             print(f"[BIAS] after steering: {new_proportion:.4f}")
 
     return modified_weights
+
+
+# def compute_spotlight_bias(
+#     logits: torch.Tensor,
+#     span_ranges: List[List[Tuple[int, int]]],
+#     target_proportion: float,
+# ) -> torch.Tensor:
+#     """
+#     Apply Spotlight attention biasing per query position (paper equation 3).
+
+#     For each query position i, computes the current attention proportion on the
+#     span and applies a bias to steer it toward the target. This is done
+#     independently per (head, query_position) pair.
+
+#     Args:
+#         logits: Raw attention logits, shape [batch, num_heads, q_len, k_len]
+#         span_ranges: List of span-range lists (one per batch item)
+#         target_proportion: Target proportion of attention on span (0.0 to 1.0)
+
+#     Returns:
+#         Modified attention weights (post-softmax), same shape as logits
+#     """
+#     # Compute baseline attention weights
+#     # attn_weights: [batch, heads, q_len, k_len]
+#     attn_weights = F.softmax(logits.float(), dim=-1)
+#     logits_modified = logits.float().clone()
+
+#     for batch_idx, ranges in enumerate(span_ranges):
+#         if not ranges:
+#             continue
+
+#         # Boolean mask for span key positions: [k_len]
+#         k_len = logits.shape[-1]
+#         span_mask = torch.zeros(k_len, device=logits.device, dtype=torch.bool)
+#         for start, end in ranges:
+#             span_mask[start:end] = True
+
+#         # Per-position current proportion: [heads, q_len]
+#         # Sum of attention mass each (head, query) places on span keys
+#         current_p = attn_weights[batch_idx, :, :, span_mask].sum(dim=-1)
+
+#         # Only steer rows where current < target
+#         needs_steering = current_p < target_proportion
+
+#         if not needs_steering.any():
+#             print(f"[BIAS] batch={batch_idx}: no rows need steering (min current={current_p.min():.4f})")
+#             continue
+
+#         # Clamp to avoid log(0) / division by zero
+#         current_p_clamped = current_p.clamp(min=1e-6)
+
+#         # Per-position bias: log(target / current) — shape [heads, q_len]
+#         bias = torch.log(
+#             torch.tensor(target_proportion, device=logits.device, dtype=torch.float32)
+#             / current_p_clamped
+#         )
+
+#         # Zero out bias where steering isn't needed
+#         bias = bias * needs_steering.float()
+
+#         # Apply bias to span key positions in the logits
+#         # bias: [heads, q_len] → [heads, q_len, 1] broadcast to span columns
+#         logits_modified[batch_idx, :, :, span_mask] += bias.unsqueeze(-1)
+
+#         # Diagnostic
+#         new_weights = F.softmax(logits_modified[batch_idx], dim=-1)
+#         new_p = new_weights[:, :, span_mask].sum(dim=-1)
+#         pct_steered = needs_steering.float().mean() * 100
+#         print(f"[BIAS] batch={batch_idx}: {pct_steered:.0f}% rows steered, "
+#               f"proportion {current_p.mean():.4f} -> {new_p.mean():.4f} (target={target_proportion})")
+
+#     return F.softmax(logits_modified, dim=-1).to(logits.dtype)
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:

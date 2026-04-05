@@ -74,6 +74,17 @@ class SpotlightLLM(HookLLM):
         elif isinstance(emph_strings[0], str):
             emph_strings = [emph_strings] * len(prompts)
 
+        # Apply chat template if available (instruct models)
+        if hasattr(self.tokenizer, 'chat_template') and self.tokenizer.chat_template:
+            templated_prompts = []
+            for p in prompts:
+                messages = [{"role": "user", "content": p}]
+                templated = self.tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True
+                )
+                templated_prompts.append(templated)
+            prompts = templated_prompts
+
         params_file = None
         try:
             # Tokenize prompts with offset mappings
