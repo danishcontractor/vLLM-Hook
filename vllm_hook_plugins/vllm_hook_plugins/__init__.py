@@ -7,7 +7,7 @@ from vllm_hook_plugins.workers.probe_hidden_states_worker import ProbeHiddenStat
 from vllm_hook_plugins.analyzers.attention_tracker_analyzer import AttntrackerAnalyzer
 from vllm_hook_plugins.analyzers.core_reranker_analyzer import CorerAnalyzer
 from vllm_hook_plugins.analyzers.hidden_states_analyzer import HiddenStatesAnalyzer
-from vllm_hook_plugins.utils.spotlight_utils import generate_with_spotlight
+from vllm_hook_plugins.utils.spotlight.utils import generate_with_spotlight
 
 
 def register_plugins():
