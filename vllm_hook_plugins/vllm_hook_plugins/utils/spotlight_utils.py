@@ -4,10 +4,14 @@ Extracted from agent-lifecycle-toolkit for reuse in vLLM Hook.
 
 Option B Implementation: Q/K capture with logit-direct bias application.
 """
-from typing import List, Sequence, Tuple
+import os
+import json
+from typing import List, Optional, Sequence, Tuple, Union
 import math
 import torch
 import torch.nn.functional as F
+
+from vllm import SamplingParams
 
 
 def find_span(
@@ -228,87 +232,7 @@ def compute_spotlight_bias(
             bias_mask = union_mask * bias_value
 
             # Apply bias in log-domain of attention weights, then re-softmax
-            attn_logits = logits[batch_idx].float()
-            attn_logits = attn_logits + bias_mask
-            modified_weights[batch_idx] = F.softmax(
-                attn_logits, dim=-1, dtype=torch.float32
-            ).to(modified_weights.dtype)
-
-            # Diagnostic: verify new proportion
-            new_proportion = (
-                modified_weights[batch_idx] * union_mask
-            ).sum() / modified_weights[batch_idx].sum()
-            print(f"[BIAS] after steering: {new_proportion:.4f}")
-
-    return modified_weights
-
-
-def compute_spotlight_bias(
-    logits: torch.Tensor,
-    span_ranges: List[List[Tuple[int, int]]],
-    target_proportion: float,
-) -> torch.Tensor:
-    """
-    Apply Spotlight attention biasing (matches reference implementation).
-
-    Reference: agent-lifecycle-toolkit SpotLightComponent.create_attention_bias_hook
-
-    Algorithm (per batch item):
-    1. Compute attention weights via softmax(logits)
-    2. Compute current_proportion = sum of attention on span / total
-    3. If current_proportion < target_proportion:
-       a. Convert weights to log-domain: log(weights + eps)
-       b. Add bias = log(target / current) to span positions
-       c. Re-normalize with softmax
-    4. Only increases attention toward span (never decreases)
-
-    Args:
-        logits: Raw attention logits, shape [batch, num_heads, q_len, k_len]
-        span_ranges: List of span-range lists (one per batch item)
-        target_proportion: Target proportion of attention on span (0.0 to 1.0)
-
-    Returns:
-        Modified attention weights (post-softmax), same shape as logits
-    """
-    # Compute baseline attention weights
-    attn_weights = F.softmax(logits, dim=-1)
-    modified_weights = attn_weights.clone()
-
-    for batch_idx, ranges in enumerate(span_ranges):
-        if not ranges:
-            continue
-
-        # Create union mask for emphasized token positions
-        union_mask = torch.zeros(
-            modified_weights.size(-1),
-            device=modified_weights.device,
-            dtype=modified_weights.dtype,
-        )
-        for start, end in ranges:
-            union_mask[start:end] = 1.0
-        union_mask = union_mask.view(1, 1, -1)  # [1, 1, k_len]
-
-        # Current proportion: global across all heads and query positions
-        current_proportion = (
-            modified_weights[batch_idx] * union_mask
-        ).sum() / modified_weights[batch_idx].sum()
-
-        print(f"[BIAS] current={current_proportion:.4f}, target={target_proportion:.4f}, steer={current_proportion < target_proportion}")
-
-        # Only steer upward (matching reference implementation)
-        if current_proportion < target_proportion:
-            bias_value = torch.log(
-                torch.tensor(
-                    target_proportion / current_proportion,
-                    device=modified_weights.device,
-                    dtype=torch.float32,
-                )
-            )
-            bias_mask = union_mask * bias_value
-
-            # Apply bias in log-domain of attention weights, then re-softmax
             attn_logits = logits[batch_idx].float()  # Use original logits for bias application
-            #attn_logits = torch.log(modified_weights[batch_idx] + 1e-10)
             attn_logits = attn_logits + bias_mask
             modified_weights[batch_idx] = F.softmax(
                 attn_logits, dim=-1, dtype=torch.float32
@@ -321,78 +245,6 @@ def compute_spotlight_bias(
             print(f"[BIAS] after steering: {new_proportion:.4f}")
 
     return modified_weights
-
-
-# def compute_spotlight_bias(
-#     logits: torch.Tensor,
-#     span_ranges: List[List[Tuple[int, int]]],
-#     target_proportion: float,
-# ) -> torch.Tensor:
-#     """
-#     Apply Spotlight attention biasing per query position (paper equation 3).
-
-#     For each query position i, computes the current attention proportion on the
-#     span and applies a bias to steer it toward the target. This is done
-#     independently per (head, query_position) pair.
-
-#     Args:
-#         logits: Raw attention logits, shape [batch, num_heads, q_len, k_len]
-#         span_ranges: List of span-range lists (one per batch item)
-#         target_proportion: Target proportion of attention on span (0.0 to 1.0)
-
-#     Returns:
-#         Modified attention weights (post-softmax), same shape as logits
-#     """
-#     # Compute baseline attention weights
-#     # attn_weights: [batch, heads, q_len, k_len]
-#     attn_weights = F.softmax(logits.float(), dim=-1)
-#     logits_modified = logits.float().clone()
-
-#     for batch_idx, ranges in enumerate(span_ranges):
-#         if not ranges:
-#             continue
-
-#         # Boolean mask for span key positions: [k_len]
-#         k_len = logits.shape[-1]
-#         span_mask = torch.zeros(k_len, device=logits.device, dtype=torch.bool)
-#         for start, end in ranges:
-#             span_mask[start:end] = True
-
-#         # Per-position current proportion: [heads, q_len]
-#         # Sum of attention mass each (head, query) places on span keys
-#         current_p = attn_weights[batch_idx, :, :, span_mask].sum(dim=-1)
-
-#         # Only steer rows where current < target
-#         needs_steering = current_p < target_proportion
-
-#         if not needs_steering.any():
-#             print(f"[BIAS] batch={batch_idx}: no rows need steering (min current={current_p.min():.4f})")
-#             continue
-
-#         # Clamp to avoid log(0) / division by zero
-#         current_p_clamped = current_p.clamp(min=1e-6)
-
-#         # Per-position bias: log(target / current) — shape [heads, q_len]
-#         bias = torch.log(
-#             torch.tensor(target_proportion, device=logits.device, dtype=torch.float32)
-#             / current_p_clamped
-#         )
-
-#         # Zero out bias where steering isn't needed
-#         bias = bias * needs_steering.float()
-
-#         # Apply bias to span key positions in the logits
-#         # bias: [heads, q_len] → [heads, q_len, 1] broadcast to span columns
-#         logits_modified[batch_idx, :, :, span_mask] += bias.unsqueeze(-1)
-
-#         # Diagnostic
-#         new_weights = F.softmax(logits_modified[batch_idx], dim=-1)
-#         new_p = new_weights[:, :, span_mask].sum(dim=-1)
-#         pct_steered = needs_steering.float().mean() * 100
-#         print(f"[BIAS] batch={batch_idx}: {pct_steered:.0f}% rows steered, "
-#               f"proportion {current_p.mean():.4f} -> {new_p.mean():.4f} (target={target_proportion})")
-
-#     return F.softmax(logits_modified, dim=-1).to(logits.dtype)
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -413,3 +265,95 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
         batch, num_key_value_heads, n_rep, slen, head_dim
     )
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
+
+# ============================================================================
+# User-facing convenience function
+# ============================================================================
+
+def generate_with_spotlight(
+    llm,
+    prompts: Union[str, List[str]],
+    emph_strings: Union[str, List[str], List[List[str]]],
+    alpha: float = 0.2,
+    sampling_params: Optional[SamplingParams] = None,
+    **kwargs
+):
+    """
+    Generate with Spotlight attention steering toward emphasized spans.
+
+    Standalone function that works with any HookLLM instance configured
+    with worker_name="probe_spotlight".
+
+    Args:
+        llm: A HookLLM instance with worker_name="probe_spotlight"
+        prompts: Input prompt(s)
+        emph_strings: Text span(s) to emphasize:
+            - Single string: applied to all prompts
+            - List of strings: applied to all prompts
+            - List of lists: one list per prompt
+        alpha: Target attention proportion (0.0-1.0)
+        sampling_params: vLLM SamplingParams
+        **kwargs: Additional vLLM generate kwargs (max_tokens, temperature, etc.)
+
+    Returns:
+        vLLM RequestOutput objects
+    """
+    # Normalize inputs
+    if isinstance(prompts, str):
+        prompts = [prompts]
+
+    if isinstance(emph_strings, str):
+        emph_strings = [[emph_strings]] * len(prompts)
+    elif isinstance(emph_strings[0], str):
+        emph_strings = [emph_strings] * len(prompts)
+
+    # Apply chat template if available (instruct models)
+    if hasattr(llm.tokenizer, 'chat_template') and llm.tokenizer.chat_template:
+        templated_prompts = []
+        for p in prompts:
+            messages = [{"role": "user", "content": p}]
+            templated = llm.tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+            templated_prompts.append(templated)
+        prompts = templated_prompts
+
+    params_file = None
+    try:
+        # Tokenize prompts with offset mappings
+        tokenized = llm.tokenizer(
+            prompts,
+            return_tensors="pt",
+            return_offsets_mapping=True,
+            padding=True,
+        )
+        offset_mappings = tokenized.pop("offset_mapping")
+
+        # Convert text spans to token ranges
+        span_ranges = get_span_ranges(prompts, emph_strings, offset_mappings)
+
+        # Write parameters to file for worker to read (cross-process safe)
+        params_file = os.path.join(llm._hook_dir, "spotlight_params.json")
+        with open(params_file, 'w') as f:
+            json.dump({
+                "span_ranges": span_ranges,
+                "alpha": alpha,
+            }, f)
+
+        # Generate with hooks enabled
+        result = llm.generate(
+            prompts=prompts,
+            sampling_params=sampling_params,
+            use_hook=True,
+            **kwargs
+        )
+        return result
+
+    finally:
+        # Clean up parameters file after generation
+        try:
+            if params_file and os.path.exists(params_file):
+                os.remove(params_file)
+        except (OSError, NameError, TypeError):
+            pass
